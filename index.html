@@ -7,6 +7,73 @@
     <link
         href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600&family=Orbitron:wght@600;800&family=Rajdhani:wght@500;700&display=swap"
         rel="stylesheet">
+
+    <!-- Firebase SDKs -->
+    <script type="module">
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/10.8.0/firebase-app.js";
+        import { getFirestore, collection, doc, getDocs, setDoc, deleteDoc, onSnapshot } from "https://www.gstatic.com/firebasejs/10.8.0/firebase-firestore.js";
+        import { getAuth, signInAnonymously, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/10.8.0/firebase-auth.js";
+
+        // TODO: Replace with your Firebase project configuration
+        // 1. Go to https://console.firebase.google.com/
+        // 2. Create a new project
+        // 3. Add a Web App
+        // 4. Copy the "firebaseConfig" object and paste it here
+        const firebaseConfig = {
+            apiKey: "YOUR_API_KEY",
+            authDomain: "YOUR_PROJECT_ID.firebaseapp.com",
+            projectId: "YOUR_PROJECT_ID",
+            storageBucket: "YOUR_PROJECT_ID.appspot.com",
+            messagingSenderId: "YOUR_MESSAGING_SENDER_ID",
+            appId: "YOUR_APP_ID"
+        };
+
+        let db;
+        let auth;
+        let currentUser = null;
+
+        try {
+            if (firebaseConfig.apiKey === "YOUR_API_KEY") {
+                throw new Error("Config not set");
+            }
+            const app = initializeApp(firebaseConfig);
+            db = getFirestore(app);
+            auth = getAuth(app);
+            console.log("Firebase initialized");
+
+            // Anonymous Auth
+            signInAnonymously(auth).catch((error) => {
+                console.error("Auth failed", error);
+            });
+
+            onAuthStateChanged(auth, (user) => {
+                if (user) {
+                    console.log("Signed in as", user.uid);
+                    currentUser = user;
+                } else {
+                    currentUser = null;
+                }
+            });
+
+        } catch (e) {
+            console.warn("Firebase not configured:", e.message);
+            window.addEventListener('load', () => {
+                const banner = document.createElement('div');
+                banner.style.cssText = "position:fixed;top:0;left:0;right:0;background:#ff003c;color:white;text-align:center;padding:10px;z-index:99999;font-weight:bold;";
+                banner.innerHTML = "⚠️ Firebase設定が完了していません。index.htmlの'firebaseConfig'を書き換えてください。（データ共有機能はオフラインです）";
+                document.body.appendChild(banner);
+                document.body.style.paddingTop = "50px"; // banner space
+            });
+        }
+
+        window.db = db;
+        window.collection = collection;
+        window.doc = doc;
+        window.getDocs = getDocs;
+        window.setDoc = setDoc;
+        window.deleteDoc = deleteDoc;
+        window.onSnapshot = onSnapshot;
+    </script>
     <style>
         :root {
             --bg: #0b0b0b;
@@ -1045,12 +1112,8 @@
         const PLAN_PRESETS = {}; // 月間トレーニング（週別）は削除されました
         const CUSTOM_PLANS_KEY = "coach_dashboard_custom_plans_v1";
         let CUSTOM_PLANS = [];
-        try {
-            const raw = localStorage.getItem(CUSTOM_PLANS_KEY);
-            if (raw) CUSTOM_PLANS = JSON.parse(raw);
-        } catch (e) {
-            console.warn(e);
-        }
+        // ローカルストレージ読み込みは削除し、非同期初期化に任せる
+
 
         /** ===== テーマ定義 ===== */
         const CATEGORY_THEMES = [
@@ -1126,53 +1189,93 @@
         /** ===== カスタムメニュー（ローカルストレージ） ===== */
         const CUSTOM_MENUS_KEY = "coach_dashboard_custom_menus_v1";
 
-        function loadCustomMenus() {
-            const raw = localStorage.getItem(CUSTOM_MENUS_KEY);
-            if (!raw) return;
+        // 非同期に変更
+        async function loadCustomMenus() {
+            if (!window.db) {
+                // Fallback to local storage if DB not ready (or config missing)
+                const raw = localStorage.getItem(CUSTOM_MENUS_KEY);
+                if (!raw) return;
+                try {
+                    processCustomMenus(JSON.parse(raw));
+                } catch (e) { console.warn(e); }
+                return;
+            }
+
+            // Firestoreから読み込み
             try {
-                const customs = JSON.parse(raw);
-                if (!Array.isArray(customs)) return;
-
-                const inflated = customs.map(inflateMenu);
-
-                for (const m of inflated) {
-                    m.id = String(m.id); // Ensure ID is string
-                    // IDが既存(デフォルト)なら上書き、なければ追加
-                    const idx = MENUS.findIndex(existing => String(existing.id) === m.id);
-                    if (idx >= 0) {
-                        MENUS[idx] = m;
-                    } else {
-                        MENUS.push(m);
-                    }
-                    MENU_BY_ID[m.id] = m;
-                }
+                // リアルタイムリスナーを設定
+                window.onSnapshot(window.collection(window.db, "custom_menus"), (snapshot) => {
+                    const customs = [];
+                    snapshot.forEach((doc) => {
+                        customs.push(doc.data());
+                    });
+                    processCustomMenus(customs);
+                    // UI更新
+                    applyTheme(currentThemeId);
+                    renderManagerList();
+                });
             } catch (e) {
-                console.warn("カスタムメニュー読み込みエラー", e);
+                console.error("Firestore load error:", e);
             }
         }
 
-        function saveCustomMenuToStorage(menu) {
+        function processCustomMenus(customs) {
+            if (!Array.isArray(customs)) return;
+            const inflated = customs.map(inflateMenu);
+
+            // 既存のカスタムメニューをクリアして再適用（重複防止のため、ただしIDベースでマージする）
+            // ここではシンプルに「カスタムメニュー」としてマークされたものをMENUSから一度除外したほうが安全だが
+            // 既存ロジックに合わせて上書きインサートする
+
+            for (const m of inflated) {
+                m.id = String(m.id);
+                const idx = MENUS.findIndex(existing => String(existing.id) === m.id);
+                if (idx >= 0) {
+                    MENUS[idx] = m;
+                } else {
+                    MENUS.push(m);
+                }
+                MENU_BY_ID[m.id] = m;
+            }
+        }
+
+        async function saveCustomMenuToStorage(menu) {
+            // Local Storage fallback
             const raw = localStorage.getItem(CUSTOM_MENUS_KEY);
             let customs = [];
             try { customs = JSON.parse(raw) || []; } catch (e) { }
-
-            // IDが既存なら更新
             const idx = customs.findIndex(m => m.id === menu.id);
-            if (idx >= 0) {
-                customs[idx] = menu;
-            } else {
-                customs.push(menu);
-            }
+            if (idx >= 0) customs[idx] = menu;
+            else customs.push(menu);
             localStorage.setItem(CUSTOM_MENUS_KEY, JSON.stringify(customs));
+
+            // Firestore sync
+            if (window.db) {
+                try {
+                    await window.setDoc(window.doc(window.db, "custom_menus", String(menu.id)), menu);
+                } catch (e) {
+                    console.error("Firestore save error:", e);
+                    alert("クラウドへの保存に失敗しました。設定を確認してください。");
+                }
+            }
         }
 
-        function deleteCustomMenuFromStorage(id) {
+        async function deleteCustomMenuFromStorage(id) {
+            // Local Storage fallback
             const raw = localStorage.getItem(CUSTOM_MENUS_KEY);
             let customs = [];
             try { customs = JSON.parse(raw) || []; } catch (e) { }
-
             customs = customs.filter(m => m.id !== id);
             localStorage.setItem(CUSTOM_MENUS_KEY, JSON.stringify(customs));
+
+            // Firestore sync
+            if (window.db) {
+                try {
+                    await window.deleteDoc(window.doc(window.db, "custom_menus", String(id)));
+                } catch (e) {
+                    console.error("Firestore delete error:", e);
+                }
+            }
         }
 
         /** ===== 状態 ===== */
@@ -1728,7 +1831,25 @@
             localStorage.setItem(STORAGE_KEY, JSON.stringify(obj));
         }
 
-        function loadState() {
+        async function loadState() {
+            // Load plans from Firestore
+            if (window.db) {
+                try {
+                    const snapshot = await window.getDocs(window.collection(window.db, "plans"));
+                    const plans = [];
+                    snapshot.forEach(d => plans.push(d.data()));
+                    CUSTOM_PLANS = plans;
+                    // UI更新
+                    buildThemeSelect();
+                } catch (e) {
+                    console.error("Failed to load plans from DB", e);
+                }
+            } else {
+                // Fallback
+                const rawPlans = localStorage.getItem(CUSTOM_PLANS_KEY);
+                if (rawPlans) CUSTOM_PLANS = JSON.parse(rawPlans);
+            }
+
             const raw = localStorage.getItem(STORAGE_KEY);
             if (!raw) return false;
             try {
@@ -1751,8 +1872,6 @@
                 applyTheme(themeSelect.value, true);
                 if (selectedDetailId && MENU_BY_ID[selectedDetailId]) renderDetail(MENU_BY_ID[selectedDetailId]);
 
-                // 初回描画
-                // 初回描画
                 renderTimeline();
 
                 return true;
@@ -1817,6 +1936,10 @@
             if (!plan) return;
 
             if (confirm(`カスタムプラン「${plan.name}」を削除してもよろしいですか？\nこの操作は取り消せません。`)) {
+                if (window.db) {
+                    // Firestore delete
+                    deleteFromFirestore("plans", id).catch(err => alert("クラウド削除エラー: " + err));
+                }
                 CUSTOM_PLANS = CUSTOM_PLANS.filter(p => p.id !== id);
                 localStorage.setItem(CUSTOM_PLANS_KEY, JSON.stringify(CUSTOM_PLANS));
 
@@ -1831,12 +1954,11 @@
             }
         });
 
-        document.getElementById("saveBtn").addEventListener("click", () => {
+        document.getElementById("saveBtn").addEventListener("click", async () => {
             // 1. まず現在の状態を通常保存
             saveState();
 
             // 2. 名前を付けてカスタムプランとして保存するか確認
-            // キャンセルなら「一時保存」のまま
             const name = prompt("現在の内容を「カスタムプラン」として保存してリストに追加しますか？\n\n・はい：名前を入力してOK\n・いいえ：キャンセル（現在の一時保存のみ）", "マイプラン " + new Date().toLocaleDateString());
 
             if (name) {
@@ -1851,10 +1973,19 @@
                 CUSTOM_PLANS.push(newPlan);
                 localStorage.setItem(CUSTOM_PLANS_KEY, JSON.stringify(CUSTOM_PLANS));
 
+                // Firestore save
+                if (window.db) {
+                    try {
+                        await window.setDoc(window.doc(window.db, "plans", newPlan.id), newPlan);
+                    } catch (e) {
+                        alert("クラウド保存エラー: " + e);
+                    }
+                }
+
                 // リスト再構築して選択
                 buildThemeSelect();
                 themeSelect.value = "custom:" + newPlan.id;
-                applyTheme(themeSelect.value, true); // Overwrite不要（今保存したばかりだから同じ）
+                applyTheme(themeSelect.value, true);
 
                 alert(`「${name}」を保存しました`);
             } else {
@@ -1864,6 +1995,11 @@
                 setTimeout(() => btn.textContent = old, 1200);
             }
         });
+
+        async function deleteFromFirestore(col, id) {
+            if (!window.db) return;
+            await window.deleteDoc(window.doc(window.db, col, String(id)));
+        }
 
 
 
@@ -2118,14 +2254,20 @@
 
         /** ===== 初期化 ===== */
         /** ===== 初期化 ===== */
-        (function init() {
+        (async function init() {
             try {
-                loadCustomMenus(); // カスタムメニュー読み込み
+                // Wait for DB to be potentially ready (simple delay or just proceed, module loading is async)
+                // In a real module script this is cleaner, but here we just proceed.
+
+                await loadCustomMenus(); // カスタムメニュー読み込み(Async & Realtime)
+                await loadState(); // プラン読み込み
+
                 buildThemeSelect();
 
+                // 初期表示セット（loadStateでやってるが、プラン読込後に再セットが必要な場合もある）
                 themeSelect.value = currentThemeId;
                 applyTheme(currentThemeId);
-                loadState();
+
             } catch (e) {
                 console.error("Init Error:", e);
             }
